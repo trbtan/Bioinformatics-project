@@ -1,0 +1,596 @@
+---
+title: "RNA seq practice"
+execute:
+  message: false
+  warning: false
+format: html
+editor: visual
+---
+
+## Preface
+
+This is an attempt to replicate this paper [Baoyu Wu et al. Discov Oncol 2023](10.1007/s12672-023-00725-z), which uses RNA seq data from this paper [Jared M. Andrews et al. Discov Sci 2021](10.1016/j.ebiom.2021.103559)
+
+**Disclaimer 1:** There seems to be discrepancy in count data btw 2 papers, personally I trust the 2nd paper as it is published in a more reliable journal and my generated normalized count matrix was close to the 2nd one.
+
+**Disclaimer 2:** I am by no means an expert in bioinformatic. This is my attempt to perform differential expression analysis & gene set enrichment analysis in R and also use the DEG data in other tools to identify potential targets for B cell malignancies. ***Any feedback is highly welcome!!!!!***
+
+**Disclaimer 3:** The sample size is low, and B cells sources are different, i.e. CLL from blood, DLBCL/FL from lymph nodes, healthy from tonsils; therefore, the results here might not be conclusive, these are mainly for my practice.
+
+# Differential Expression Analysis (DESeq2)
+
+I follow the guide of:
+
+```{r}
+#| eval: false
+vignette("DESeq2")
+vignette("rnaseqGene")
+```
+
+*Sound out to Michael Love, who also taught a great course series on HarvardX.*
+
+## Import tx files (SALMON)
+
+Tx files available on [GSE145842](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE145842).
+
+```{r}
+library(tidyverse)
+
+files <- list.files( 
+  pattern = "\\quant.sf.txt$", 
+  full.names = TRUE
+)
+files <- file.path(files)
+sample_names <- str_extract(files, "(?<=_).+(?=_)")
+names(files) <- sample_names
+all(file.exists(files)) # confirm all 29 files present
+```
+
+Get txdb annotation using AnnotationHub or gtf file.
+
+```{r}
+library(AnnotationHub)
+ah <- AnnotationHub()
+ah_gencode <- subset(ah, species == "Homo sapiens" & dataprovider == "GENCODE")
+query(ah_gencode, "v31")  
+txdb <- ah[["AH75182"]]
+```
+
+gtf files downloaded from <https://www.gencodegenes.org/human/release_31lift37.html>
+
+```{r}
+library(GenomicFeatures)
+gtf <- file.path(list.files(pattern = "\\.gtf$", full.names = TRUE))
+txdb <- makeTxDbFromGFF(gtf)
+```
+
+Make tx2gene annotation.
+
+```{r}
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- select(txdb, k, "GENEID", "TXNAME")
+```
+
+Finally import tx files.
+
+```{r}
+library(tximport)
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene)
+```
+
+Take a look.
+
+```{r}
+#| echo: false
+head(txi$counts)
+```
+
+I can save for convenience.
+
+```{r}
+write_rds(txi, "txi.rds")
+# txi <- read_rds("txi.rds") # later
+```
+
+## Create DESeq Dataset
+
+Make sample information table first (based on disease status).
+
+```{r}
+sample_info <- data.frame(factor(str_extract(colnames(txi$counts), "CLL|DL|FL|TS")))
+rownames(sample_info) <- colnames(txi$counts)
+colnames(sample_info) <- "status"
+knitr::kable(sample_info)
+table(sample_info$status)
+```
+
+Here TS means healthy TonSils.
+
+Import
+
+```{r}
+library(DESeq2)
+dds <- DESeqDataSetFromTximport(txi, colData = sample_info, design = ~ status)
+dds <- estimateSizeFactors(dds)
+```
+
+Sample quality control by PCA
+
+```{r}
+rld <- rlog(dds) # rlog instead of vsd for small sample size n < 30
+plotPCA(rld, intgroup = "status")
+```
+
+PC1 seperate case-control, PC2 separate CLL from DLBCL & FL.
+
+Sample quality control by heatmaps
+
+```{r}
+library(pheatmap)
+select <- order(rowMeans(counts(dds, normalized = TRUE)),
+                decreasing = TRUE)[1:20]
+df <- as.data.frame(colData(dds))
+pheatmap(assay(rld)[select, ], annotation_col = df,
+         cluster_rows = FALSE, show_rownames = FALSE)
+
+sampleDists <- dist(t(assay(rld)))
+sampleDistMatrix <- as.matrix(sampleDists)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         show_rownames = FALSE)
+```
+
+Clearly there are low quality samples, I intend to minimize batch effects by SVA.
+
+## Batch correction by Surrogate Variable Analysis
+
+Identify unknown batch effects by svaseq.
+
+```{r}
+dat <- counts(dds, normalized = TRUE)
+dat <- dat[rowMeans(dat) > 1, ] # prefilter low-count genes 
+dds$status <- relevel(dds$status, "TS") # set baseline to healthy
+
+library(sva)
+mod <- model.matrix(~ status, colData(dds))
+mod0 <- model.matrix(~ 1, colData(dds))
+svseq <- svaseq(dat, mod, mod0, n.sv = 2)
+```
+
+Visualize surrogate variables.
+
+```{r}
+svseq_sv <- tibble(SV1 = svseq$sv[,1],
+                   SV2 = svseq$sv[,2])
+library(ggrepel)
+svseq_sv |> 
+  mutate(sample = colnames(dds),
+         status = dds$status) |> 
+  ggplot(aes(x = SV1, y = SV2, color = status)) +
+  geom_point() +
+  geom_text_repel(aes(label = sample)) 
+
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:2) {
+  stripchart(svseq$sv[, i] ~ dds$status, 
+             vertical = TRUE, 
+             main = paste0("SV", i))
+  abline(h = 0)
+}
+```
+
+There are 2 outliers: TS081111A and DL191.
+
+## Run DESeq
+
+Add SV1 and SV2 to design.
+
+```{r}
+dds$SV1 <- svseq$sv[,1]
+dds$SV2 <- svseq$sv[,2]
+design(dds) <- ~ SV1 + SV2 + status
+```
+
+Prefilter low count genes (optional).
+
+```{r}
+dds <- dds[rowSums(counts(dds) >= 10) >= 5] 
+```
+
+Run DESeq.
+
+```{r}
+dds <- DESeq(dds)
+```
+
+I can save for convenience.
+
+```{r}
+write_rds(dds, "dds.rds")
+# dds <- read_rds("dds.rds") # later
+```
+
+# Extract DEGs and Visualize
+
+## CLL vs healthy
+
+DEGs defined as log2FC \> 1 and padj \< 0.01
+
+```{r}
+res_CLL <- results(
+  dds, 
+  contrast = c("status", "CLL", "TS"),
+  lfcThreshold = 1, 
+  alpha = 0.01
+  )
+```
+
+Get gene symbols
+
+```{r}
+library(org.Hs.eg.db)
+ens.str_CLL <- substr(rownames(res_CLL), 1, 15)
+res_CLL$symbol <- mapIds(org.Hs.eg.db, ens.str_CLL, "SYMBOL", "ENSEMBL")
+```
+
+Gene symbols of DEGs
+
+```{r}
+CLL_DEG <- res_CLL[res_CLL$padj < 0.01 & !is.na(res_CLL$padj), ]$symbol
+CLL_DEG <- CLL_DEG[!is.na(CLL_DEG)] # some genes couldn't be annotated
+```
+
+Gene symbols of upregulated DEGs
+
+```{r}
+CLL_DEG_up <- res_CLL[res_CLL$padj < 0.01 & 
+                      !is.na(res_CLL$padj) & 
+                      res_CLL$log2FoldChange > 1, ]$symbol
+CLL_DEG_up <- CLL_DEG_up[!is.na(CLL_DEG_up)]
+```
+
+## DLBCL vs healthy
+
+Repeat
+
+```{r}
+res_DL <- results(
+  dds, 
+  contrast = c("status", "DL", "TS"),
+  lfcThreshold = 1, 
+  alpha = 0.01
+  )
+
+ens.str_DL <- substr(rownames(res_DL), 1, 15)
+res_DL$symbol <- mapIds(org.Hs.eg.db, ens.str_DL, "SYMBOL", "ENSEMBL")
+
+DL_DEG <- res_DL[res_DL$padj < 0.01 & !is.na(res_DL$padj), ]$symbol
+DL_DEG <- DL_DEG[!is.na(DL_DEG)]
+
+DL_DEG_up <- res_DL[res_DL$padj < 0.01 & 
+                      !is.na(res_DL$padj) & 
+                      res_DL$log2FoldChange > 1, ]$symbol
+DL_DEG_up <- DL_DEG_up[!is.na(DL_DEG_up)]
+```
+
+## FL vs healthy
+
+Repeat
+
+```{r}
+res_FL <- results(
+  dds, 
+  contrast = c("status", "FL", "TS"),
+  lfcThreshold = 1, 
+  alpha = 0.01
+  )
+
+ens.str_FL <- substr(rownames(res_FL), 1, 15)
+res_FL$symbol <- mapIds(org.Hs.eg.db, ens.str_FL, "SYMBOL", "ENSEMBL")
+
+FL_DEG <- res_FL[res_FL$padj < 0.01 & !is.na(res_FL$padj), ]$symbol
+FL_DEG <- FL_DEG[!is.na(FL_DEG)]
+
+FL_DEG_up <- res_FL[res_FL$padj < 0.01 & 
+                      !is.na(res_FL$padj) & 
+                      res_FL$log2FoldChange > 1, ]$symbol
+FL_DEG_up <- FL_DEG_up[!is.na(FL_DEG_up)]
+```
+
+### Visualize by Volcano plot and MA plot (CLL as an example)
+
+Shrink logFC for better visualization.
+
+```{r}
+reslfc_CLL <- lfcShrink(
+  dds, 
+  contrast = c("status", "CLL", "TS"),
+  res = res_CLL,
+  type = "ashr"
+  )
+```
+
+Volcano plot
+
+```{r}
+library(EnhancedVolcano)
+EnhancedVolcano(
+  reslfc_CLL,
+  lab = res_CLL$symbol,
+  x = "log2FoldChange",
+  y = "padj"
+  )
+```
+
+MA plot
+
+```{r}
+plotMA(reslfc_CLL)
+```
+
+### Visualize by heat map (CLL as an example)
+
+```{r}
+rld <- rlog(dds, blind = FALSE)
+
+res_CLL = res_CLL[order(res_CLL$padj),]
+topgenes = head(rownames(res_CLL), 500)
+
+mat = assay(rld)[topgenes, which(colData(rld)$status %in% c("CLL", "TS"))]
+mat = mat - rowMeans(mat)
+df = as.data.frame(colData(rld)[which(colData(rld)$status %in% c("CLL", "TS")),1])
+
+rownames(df) <- colnames(mat)
+colnames(df) <- "status"
+pheatmap(mat, 
+         annotation_col = df,
+         cluster_rows = FALSE, 
+         show_rownames = FALSE)
+```
+
+## Visualize common DEGs in 3 B cell malignancies by Venn diagram
+
+Common DEGs and upregulated DEGs
+
+```{r}
+library(ggvenn)
+ggvenn(
+  list("CLL" = CLL_DEG, "DLBCL" = DL_DEG, "FL" = FL_DEG),
+  show_percentage = FALSE
+)
+ggvenn(
+  list("CLL" = CLL_DEG_up, "DLBCL" = DL_DEG_up, "FL" = FL_DEG_up),
+  show_percentage = FALSE
+)
+```
+
+Identify and export protein-coding common DEGs
+
+```{r}
+common_DEG <- intersect(intersect(CLL_DEG, DL_DEG), FL_DEG)
+common_DEG <- common_DEG[which(
+  select(org.Hs.eg.db, common_DEG, "GENETYPE", "SYMBOL")[,2] == "protein-coding")]
+
+common_DEG_up <- intersect(intersect(CLL_DEG_up, DL_DEG_up), FL_DEG_up)
+common_DEG_up <- common_DEG_up[which(
+  select(org.Hs.eg.db, common_DEG_up, "GENETYPE", "SYMBOL")[,2] == "protein-coding")]
+
+write_csv(data.frame(
+  gene = common_DEG,
+  change = if_else(common_DEG %in% common_DEG_up, "up", "down")), 
+"common_DEG.csv")
+```
+
+## STRING network analysis using cytoscape software
+
+I import common DEGs into Cytoscape StringApp.
+
+![Yellow border: VCAM-1 & those directly connected to VCAM-1](STRING%20network.png)
+
+I identified VCAM-1 as one of the center proteins and will use it as a drug target to practice cheminformatics.
+
+*Limitation: I am extrapolating proteomes from transcriptomes, which is not always appropriate.*
+
+Visualize VCAM1 expression across samples.
+
+```{r}
+plotCounts(dds, gene = "ENSG00000162692.12_4", intgroup = "status")
+```
+
+# Enrichment analysis (ORA & GSEA)
+
+I follow the guide of:
+
+```{r}
+#| eval: false
+vignette("clusterProfiler")
+```
+
+Gene sets are downloaded from [MSigDb](https://www.gsea-msigdb.org/gsea/msigdb/human/collections.jsp#H).
+
+## Over-representation analysis (CLL & Hallmark as an example)
+
+I perform ORA separately for up- and down-regulated genes
+
+Import Hallmark gene sets
+
+```{r}
+library(clusterProfiler)
+hallmark_gmt <- read.gmt("./h.all.v2024.1.Hs.symbols.gmt")
+```
+
+Up-regulated DEGs:
+
+```{r}
+em_hall_up <- enricher(gene = CLL_DEG_up, 
+                TERM2GENE = hallmark_gmt)
+barplot(em_hall_up)
+dotplot(em_hall_up)
+cnetplot(em_hall_up)
+```
+
+VCAM1 being 1 of the genes belonging to EMT hallmark.
+
+Down-regulated DEGs:
+
+```{r}
+em_hall_down <- enricher(gene = CLL_DEG[!(CLL_DEG %in% CLL_DEG_up)],
+                    TERM2GENE = hallmark_gmt)
+barplot(em_hall_down)
+dotplot(em_hall_down)
+```
+
+## Gene set enrichment analysis (CLL & GO as an example)
+
+Import GO terms gene sets
+
+```{r}
+go_gmt <- read.gmt("./c5.go.v2024.1.Hs.symbols.gmt")
+```
+
+Create and rank CLL gene list by Wald test statistics
+
+```{r}
+geneList_CLL <- res_CLL$stat
+names(geneList_CLL) <- res_CLL$symbol
+geneList_CLL <- geneList_CLL[order(geneList_CLL, decreasing = TRUE)]
+geneList_CLL <- geneList_CLL[!is.na(names(geneList_CLL))]
+```
+
+GSEA
+
+```{r}
+em2 <- GSEA(geneList_CLL, TERM2GENE = go_gmt)
+head(em2)
+dotplot(em2)
+gseaplot(em2,
+         geneSetID = 1,
+         title = em2$Description[1])
+```
+
+This might show B cell dysfunction.
+
+# Molecular Docking on VCAM-1
+
+## ChEMBL target query
+
+Query target report card of VCAM-1 on [ChEMBL database](https://www.ebi.ac.uk/chembl/)
+
+Look into Ligand efficiencies section
+
+![](images/clipboard-867435858.png)
+
+I select the most potent small molecule as an example for learning.
+
+Search CHEMBL119039 on [PubChem](https://pubchem.ncbi.nlm.nih.gov/) and download 3D Conformer as sdf file (CID: 10970154).
+
+Search VCAM-1 on [Protein Data Bank](https://www.rcsb.org/) and download pdb file (ID: 1VSC).
+
+I follow the Autodock 4 guide of: <https://www.youtube.com/watch?v=ZVKKsK5DsCY&t=4115s>.
+
+*Sound out to BioinformaticsCopilot channel.*
+
+Below I briefly describe the workflow.
+
+Needed software packages: Autodock 4, MGL tools, ChimeraX, Avogadro, Discovery Studio.
+
+I created a desktop file as the working directory as this makes the whole process easier.
+
+## Input preparation
+
+### Protein clean-up
+
+Open protein file on ChimeraX, delete non-standard residues and chains if present.
+
+Save as a new pdb file.
+
+### Ligand clean-up
+
+Open ligand sdf file on Avogadro. Add hydrogens. Optimize geometry until no atoms move.
+
+Save as mol2 file.
+
+### Protein and ligand preparation using MGL tools
+
+Open protein pdb file on AutoDockTools. (Edit/) Delete water. Add all hydrogens. Merge non-polar hydrogens. Add Kollman charges. Assign AD4 type (optimize force field).
+
+Grid/Macromolecule/Choose. This save protein as pdbqt file.
+
+Open ligand mol2 file on AutoDockTools. Ligand/ Detect root. Choose torsion/Make active bonds non-rotatable then make all non-rotatable bonds rotatable. This identifies the rotatable bonds. Output/save as pdbqt file.
+
+### Run Autogrid4
+
+Grid/Choose protein (preserve charges). Set map type directly. Open grid box.
+
+For blind docking, cover the whole protein with the grid box.
+
+Output/save grid as gpf file.
+
+Run/Autogrid. Output is glp file.
+
+### Run Autodock4
+
+Open pdbqt files of both protein and ligand.
+
+Docking/Macromolecule/Set Rigid Filename. Choose ligand.
+
+Search parameters:
+
+For blind docking: Genetic Algorithm - long, 100 runs
+
+For targeted docking: Simulated Annealing, Local Search Parameter
+
+*For practice, I set 50 runs (which took almost 10 hours for my laptop)*
+
+Output/save Lamarchian GA as dpf file.
+
+Run/Autodock. Output as dlg file.
+
+### Analysis
+
+Analyze/Dockings/Open dlg file.
+
+Macromolcule/Open
+
+Conformation/Play. This allows visualization of all 50 docking results.
+
+Open panel/
+
+Show info: all info from dlg file
+
+Build all: make all conformations as pdbqt files (unfortunately it counts from 0, not 1)
+
+Write complex: save the selected complex as pdbqt file
+
+Clustering/Show (clustering histogram)
+
+![](images/clipboard-1728148312.png)
+
+The best conformation cluster is 27:
+
+The ligand interacts with both chains of VCAM-1
+
+Estimated Free Energy of Binding = -8.56 kcal/mol
+
+Estimated Inhibition Constant, Ki = 531.85 nM (not as close as the experimental value)
+
+### Visualization
+
+AutoDockTools: visualize ligand and interacting aminoacids, Analyze/Dockings/Show Interactions
+
+![](images/interaction.png)
+
+![](images/interaction0.png)
+
+ChimeraX: visualize 3D complex, input: bestcomplex.pdbqt
+
+![](images/image1.png)
+
+![H bonds shown](images/image2.png)
+
+Discovery Studio: turn 3D to 2D, input: dock_conf26.pdb (converted from pdbqt in Autodocktools)
+
+![](images/clipboard-879999798.png)
+
+![](images/clipboard-1715294390.png)
